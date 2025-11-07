@@ -6,9 +6,11 @@ import torch.nn.functional as F
 from torch.utils.cpp_extension import load
 
 
+device = "cuda"
+
 cuda_extension = load(
-    name="cuda_extension",
-    sources=["vector_add_cuda.cu"],
+    name="pybind_name",
+    sources=["flash_attn.cu"],
     extra_cflags=["-O3"],
     extra_cuda_cflags=["-O3"],
 )
@@ -30,7 +32,7 @@ class FlashAttention(nn.Module):
         K = x @ self.W_key
         V = x @ self.W_value
 
-        context_vector = torch.ops.cuda_extension.flash_attn(Q, K, V)
+        context_vector = torch.ops.flash_attn.flash_attn(Q, K, V)
         
         return context_vector
 
@@ -40,15 +42,17 @@ dc = {s: i for i, s in enumerate(sorted(sentence.replace(',', '').split()))}
 print(dc)
 
 r = [dc[i] for i in sentence.replace(',', '').split()]
-sentence_int = torch.tensor(r)
+sentence_int = torch.tensor(r, device=device)
 
+
+d = 3
 vocab_size = 50000
 torch.manual_seed(0)
-embed = nn.Embedding(vocab_size, 3)
+
+embed = nn.Embedding(vocab_size, d, device=device)
 embedded_sentence = embed(sentence_int).detach()
 
-d = embedded_sentence.shape[1] # Dimension for embeddings
-fa = FlashAttention(d, 2, 2, 4)
+fa = FlashAttention(d, d, d, d).to(device)
 cv = fa(embedded_sentence)
 print(cv.shape)
 print(cv)

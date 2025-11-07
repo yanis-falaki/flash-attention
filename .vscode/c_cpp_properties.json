@@ -3,12 +3,13 @@
         {
             "name": "Linux",
             "includePath": [
-                "${workspaceFolder}/**",
-                "/usr/include/python3.12",
-                "${workspaceFolder}/.venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include"
+                "${workspaceFolder}",
+                "${workspaceFolder}/.venv/lib/python3.12/site-packages/torch/include",
+                "${workspaceFolder}/.venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include",
+                "/usr/include/python3.12"
             ],
             "defines": [],
-            "compilerPath": "/usr/bin/gcc",
+            "compilerPath": "/usr/local/cuda-12.8/bin/nvcc",
             "cStandard": "c17",
             "cppStandard": "gnu++17",
             "intelliSenseMode": "linux-gcc-x64"
