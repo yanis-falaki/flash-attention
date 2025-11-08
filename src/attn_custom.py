@@ -15,26 +15,30 @@ cuda_extension = load(
     extra_cuda_cflags=["-O3"],
 )
 
-class FlashAttention(nn.Module):
-    def __init__(self, d, d_q, d_k, d_v):
-        super(FlashAttention, self).__init__()
+class Attentions(nn.Module):
+    def __init__(self, num_heads, d):
+        super(Attentions, self).__init__()
         self.d = d
-        self.d_q = d_q
-        self.d_k = d_k
-        self.d_v = d_v
+        self.d_q = d
+        self.d_k = d
+        self.d_v = d
 
-        self.W_query = nn.Parameter(torch.randn(d, d_q))
-        self.W_key = torch.nn.Parameter(torch.rand(d, d_k))
-        self.W_value = torch.nn.Parameter(torch.rand(d, d_v))
+        self.W_query = nn.Parameter(torch.randn(1, num_heads, d, self.d_q))
+        self.W_key = torch.nn.Parameter(torch.rand(1, num_heads, d, self.d_k))
+        self.W_value = torch.nn.Parameter(torch.rand(1, num_heads, d, self.d_v))
 
     def forward(self, x):
         Q = x @ self.W_query
         K = x @ self.W_key
         V = x @ self.W_value
 
-        context_vector = torch.ops.flash_attn.flash_attn(Q, K, V)
+        attention_scores_torch = Q @ K.transpose(2, 3) / math.sqrt(self.d_k)
+        attention_weights_torch = F.softmax(attention_scores_torch, dim=3)
+        context_vector_torch = attention_weights_torch @ V
+
+        context_vector_flash = torch.ops.flash_attn.flash_attn(Q, K, V)
         
-        return context_vector
+        return context_vector_torch, context_vector_flash
 
 
 sentence = 'The quick brown fox jumps over a lazy dog'
@@ -50,9 +54,8 @@ vocab_size = 50000
 torch.manual_seed(0)
 
 embed = nn.Embedding(vocab_size, d, device=device)
-embedded_sentence = embed(sentence_int).detach()
+embedded_sentence = embed(sentence_int).unsqueeze(0).detach()
 
-fa = FlashAttention(d, d, d, d).to(device)
-cv = fa(embedded_sentence)
-print(cv.shape)
-print(cv)
+ats = Attentions(1, d).to(device)
+cvs = ats(embedded_sentence)
+print(torch.abs(cvs[0] - cvs[1]))

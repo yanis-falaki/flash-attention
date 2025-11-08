@@ -19,30 +19,49 @@ namespace flash_attn {
         int tx = threadIdx.x; // Corresponds to the row in the current head
 
         // Get start of head in qkv by skipping past batches and heads.
-        int global_batch_idx = bx * gridDim.z * blockIdx.x * d;
-        int local_head_idx = hx * blockDim.x * d;
+        int global_batch_idx = bx * gridDim.y * N * d;
+        int local_head_idx = hx * N * d;
+
+        // Global_head_idx is the same as the start of lm_offset
         int global_head_idx = global_batch_idx + local_head_idx;
 
-        // l, m offset
+        // In each inner loop lm_offset will be offset by an additional Br*i 
         int lm_offset = (bx * gridDim.y * N) + (hx * N) + tx;
 
         for (int j = 0; j < Tc; ++j) {
             // Cooperatively load Kj, Vj, each thread loads a row
-            for (int x = 0; x < d; ++x) {
-                Kj[tx*d + x] = K[global_head_idx + (tile_size * j) + (tx * d) + x];
-                Vj[tx*d + x] = V[global_head_idx + (tile_size * j) + (tx * d) + x];
-            }
+            // No need for an else branch as rows out of bounds never get used in calcs.
+            if (Bc*j + tx < N)
+                for (int x = 0; x < d; ++x) {
+                    int Kij_offset = global_head_idx + (tile_size * j) + (tx * d) + x;
+                    Kj[tx*d + x] = K[Kij_offset];
+                    Vj[tx*d + x] = V[Kij_offset];
+                }
+
+            // Ensure all K^T columns are loaded
+            __syncthreads();
+
+            // This is used for loops over Kj^T later to make sure we're not accessing OOB elements
+            int valid_kjt_bounds = min(Bc, N - Bc*j);
 
             for (int i = 0; i < Tr; ++i) {
-                // Load Qi, Oi, li, mi from HBM to on-chip SRAM
+                // If we get to a row that doesn't exist, simply don't compute it.
+                if (i * Br + tx >= N)
+                    continue;
+
+                // Load Qi, li, mi from HBM to on-chip SRAM (Paper says SRAM, but it could be loaded locally)
                 for (int x = 0; x < d; ++x) {
                     Qi[tx*d + x] = Q[global_head_idx + (tile_size * i) + (tx * d) + x];
                 }
+                // No need to sync Qi as each row in Qi is accessed by a single thread
+
+                float li = l[lm_offset + Br*i];
+                float mi = m[lm_offset + Br*i];
 
                 // Compute dot product of Qi and Kj^T, keep track of rowmax
                 float mij = -INFINITY;
-                for (int kt_c = 0; kt_c < Br; ++kt_c) {
-                    int dotprod = 0;
+                for (int kt_c = 0; kt_c < valid_kjt_bounds; ++kt_c) {
+                    float dotprod = 0.0f;
                     for (int x = 0; x < d; ++x) {
                         dotprod += Qi[tx*d + x]*Kj[kt_c*d + x];
                     }
@@ -53,29 +72,28 @@ namespace flash_attn {
 
                 // Compute Pij = exp(Sij - mij) and l_ij = rowsum(Pij)
                 float lij = 0;
-                for (int x = 0; x < Bc; ++x) {
+                for (int x = 0; x < valid_kjt_bounds; ++x) {
                     Sij[tx*Bc + x] = __expf(Sij[tx*Bc + x] - mij);
                     lij += Sij[tx*Bc + x];
                 }
 
                 // Compute mi_new = max(mi, mij)
-                float mi_prev = m[lm_offset + i*Br];
-                float mi_new = max(mi_prev, mij);
+                float mi_new = max(mi, mij);
 
                 // Compute li_new = e^(mi - mi_new)*li + e^(mij - mi_new)*lij
-                float expOld = __expf(mi_prev - mi_new);
+                float expOld = __expf(mi - mi_new);
                 float expNew = __expf(mij - mi_new);
 
-                float li_prev = l[lm_offset + i*Br];
-                float li_new = expOld*li_prev + expNew*lij;
+                float li_new = expOld*li + expNew*lij;
 
                 // Write Oi = elemwise prod of 1/li_new * li * e^(mi - mij) * Oi + e^(mij - mi_new)*Pij*Vj
                 for (int x = 0; x < d; ++x) {
-                    float pv = 0; // Pij * Vj
-                    for (int y = 0; i < Bc; ++y) {
-                        pv += Sij[(Bc * tx) + y] * Vj[(y * d) + x];
+                    float pvij = 0; // Pij * Vij
+                    for (int y = 0; y < valid_kjt_bounds; ++y) {
+                        pvij += Sij[(Bc * tx) + y] * Vj[(y * d) + x];
                     }
-                    O
+                    int O_offset = global_head_idx + (tile_size * i) + (tx * d) + x;
+                    O[O_offset] = (1.0f/li_new) * (li*expOld*O[O_offset] + expNew*pvij);
                 }
 
                 // Write mi_new and li_new to HBM
@@ -85,7 +103,7 @@ namespace flash_attn {
         }
     }
 
-    // For now we will assume that d = d_q = d_k = d_v
+    // Incoming tensor: B x H x N x D
     torch::Tensor flash_attn_cuda(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
         int B = Q.sizes()[0];
         int nh = Q.sizes()[1];
@@ -106,25 +124,26 @@ namespace flash_attn {
 
         int M = prop.sharedMemPerMultiprocessor;
 
+        // Currently Bc and Br must be identical
         const int Bc = 32;
         const int Br = 32;
 
         int Tr = ceil((float)N/Br);
         int Tc = ceil((float)N/Bc);
 
-        torch::Tensor O = torch::zeros({N, d});
-        torch::Tensor l = torch::zeros({N});
-        torch::Tensor m = torch::full({N}, -INFINITY, torch::kFloat);
         torch::Device device(torch::kCUDA);
-        l.to(device);
-        m.to(device);
+        torch::Tensor O = torch::zeros({B, nh, N, d}).to(device);
+        torch::Tensor l = torch::zeros({B, nh, N}).to(device);
+        torch::Tensor m = torch::full({B, nh, N}, -INFINITY, torch::kFloat).to(device);
 
-        float softmax_scale = 1/sqrt(d);
+        float softmax_scale = 1.0/sqrt((float)d);
         
         dim3 blocks = (B, nh);
         dim3 threads = (Bc);
 
-        flash_attn_kernel<<<blocks, threads>>>(
+        int SRAM_size = ((Bc*d * 3) + (Br*Bc)) * sizeof(float);
+
+        flash_attn_kernel<<<blocks, threads, SRAM_size>>>(
             O.data_ptr<float>(),
             Q.data_ptr<float>(),
             K.data_ptr<float>(),
@@ -132,6 +151,7 @@ namespace flash_attn {
             l.data_ptr<float>(),
             m.data_ptr<float>(),
             d,
+            N,
             Bc,
             Br,
             Tc,
